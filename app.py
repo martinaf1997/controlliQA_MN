@@ -287,6 +287,140 @@ _tmp_files = [dcm_path]  # track for cleanup
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ANTEPRIMA IMMAGINE CON ROI
+# ══════════════════════════════════════════════════════════════════════════════
+with st.expander("🖼️ Anteprima immagine & ROI", expanded=True):
+    try:
+        import warnings
+        import matplotlib.gridspec as gridspec
+        from matplotlib.colors import PowerNorm
+
+        ds_preview = pydicom.dcmread(dcm_path, force=True)
+        pixel_array = ds_preview.pixel_array.astype(float)
+        spacing = float(ds_preview.get("PixelSpacing", [4.8, 4.8])[0])
+
+        if pixel_array.ndim == 3:
+            n_fr = pixel_array.shape[0]
+            frame_idx = st.slider("Frame da visualizzare", 0, n_fr - 1, 0, format="Frame %d")
+            arr = pixel_array[frame_idx]
+        else:
+            arr = pixel_array
+            frame_idx = 0
+
+        rows, cols = arr.shape
+
+        # Controls in a compact row
+        ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns(5)
+        ufov_r   = ctrl1.slider("UFOV ratio", 0.80, 1.00, 0.95, 0.01, key="prev_ufov")
+        cfov_r   = ctrl2.slider("CFOV ratio", 0.50, 0.90, 0.75, 0.01, key="prev_cfov")
+        thresh   = ctrl3.slider("Threshold", 0.50, 1.00, 0.75, 0.05, key="prev_thresh")
+        colormap = ctrl4.selectbox("Colormap", ["hot","gray","inferno","plasma","viridis","bone"], index=0, key="prev_cmap")
+        log_scale = ctrl5.checkbox("Log scale", value=False, key="prev_log")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pu_prev = pnuc.PlanarUniformity(dcm_path)
+            pu_prev.analyze(ufov_ratio=ufov_r, cfov_ratio=cfov_r, threshold=thresh)
+
+        fr_key = str(frame_idx + 1)
+        if fr_key not in pu_prev.frame_results:
+            fr_key = list(pu_prev.frame_results.keys())[min(frame_idx, len(pu_prev.frame_results)-1)]
+        fr_data = pu_prev.frame_results[fr_key]
+
+        ufov_bx = fr_data["ufov"].boundary_x
+        ufov_by = fr_data["ufov"].boundary_y
+        cfov_bx = fr_data["cfov"].boundary_x
+        cfov_by = fr_data["cfov"].boundary_y
+        binned  = fr_data["binned_frame"]
+
+        BG = "#0d1b2a"
+        TICK = "#90e0ef"
+        TITLE_C = "#00b4d8"
+
+        fig = plt.figure(figsize=(17, 5.5), facecolor=BG)
+        gs  = gridspec.GridSpec(1, 3, figure=fig, wspace=0.35)
+
+        def style_ax(ax, title):
+            ax.set_facecolor(BG)
+            for sp in ax.spines.values():
+                sp.set_color(TICK)
+            ax.tick_params(colors=TICK, labelsize=8)
+            ax.xaxis.label.set_color(TICK)
+            ax.yaxis.label.set_color(TICK)
+            ax.set_title(title, color=TITLE_C, fontsize=12, fontweight="bold", pad=8)
+            ax.set_xlabel("mm", fontsize=8)
+            ax.set_ylabel("mm", fontsize=8)
+
+        extent = [0, cols * spacing, rows * spacing, 0]
+        norm = (PowerNorm(gamma=0.5, vmin=arr[arr>0].min() if arr[arr>0].size else 0, vmax=arr.max())
+                if log_scale else None)
+        cmap_obj = plt.colormaps[colormap]
+
+        # Panel 1 — raw
+        ax1 = fig.add_subplot(gs[0])
+        im1 = ax1.imshow(arr, cmap=cmap_obj, origin="upper", extent=extent, norm=norm, interpolation="nearest")
+        style_ax(ax1, "Immagine Raw")
+        cb1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        cb1.ax.tick_params(colors=TICK, labelsize=7)
+
+        # Panel 2 — raw + UFOV/CFOV
+        ax2 = fig.add_subplot(gs[1])
+        ax2.imshow(arr, cmap=cmap_obj, origin="upper", extent=extent, norm=norm, interpolation="nearest")
+        ax2.plot(np.append(ufov_bx, ufov_bx[0]) * spacing,
+                 np.append(ufov_by, ufov_by[0]) * spacing,
+                 color="#00ffff", lw=2.5, label="UFOV", zorder=5)
+        ax2.plot(np.append(cfov_bx, cfov_bx[0]) * spacing,
+                 np.append(cfov_by, cfov_by[0]) * spacing,
+                 color="#ffdd00", lw=2.5, linestyle="--", label="CFOV", zorder=5)
+        style_ax(ax2, "ROI: UFOV & CFOV")
+        ax2.legend(loc="upper right", facecolor="#1a2a3a", edgecolor=TICK, labelcolor="white", fontsize=9)
+
+        # Panel 3 — processed
+        ax3 = fig.add_subplot(gs[2])
+        b_rows, b_cols = binned.shape
+        b_extent = [0, b_cols * spacing, b_rows * spacing, 0]
+        scale = b_cols / cols
+        im3 = ax3.imshow(binned, cmap=cmap_obj, origin="upper", extent=b_extent, interpolation="nearest")
+        ax3.plot(np.append(ufov_bx, ufov_bx[0]) * spacing * scale,
+                 np.append(ufov_by, ufov_by[0]) * spacing * scale,
+                 color="#00ffff", lw=2.5, label="UFOV", zorder=5)
+        ax3.plot(np.append(cfov_bx, cfov_bx[0]) * spacing * scale,
+                 np.append(cfov_by, cfov_by[0]) * spacing * scale,
+                 color="#ffdd00", lw=2.5, linestyle="--", label="CFOV", zorder=5)
+        style_ax(ax3, "Immagine Processata (NMQC)")
+        cb3 = plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+        cb3.ax.tick_params(colors=TICK, labelsize=7)
+        ax3.legend(loc="upper right", facecolor="#1a2a3a", edgecolor=TICK, labelcolor="white", fontsize=9)
+
+        # Stats
+        nonzero = arr[arr > 0]
+        st.markdown(
+            f"**Dimensioni:** {rows}×{cols} px &nbsp;|&nbsp; "
+            f"**Pixel size:** {spacing:.2f} mm &nbsp;|&nbsp; "
+            f"**FOV:** {cols*spacing:.0f}×{rows*spacing:.0f} mm &nbsp;|&nbsp; "
+            f"**Max counts:** {arr.max():.0f} &nbsp;|&nbsp; "
+            f"**Mean (ROI):** {nonzero.mean():.1f} &nbsp;|&nbsp; "
+            f"**Pixel attivi:** {len(nonzero)}"
+        )
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor=BG)
+        buf.seek(0)
+        img_bytes = buf.read()
+        plt.close(fig)
+
+        st.image(img_bytes, use_container_width=True)
+        st.download_button("⬇️ Scarica anteprima ROI", img_bytes, "preview_roi.png", "image/png")
+
+    except Exception as e:
+        st.warning(f"Anteprima non disponibile: {e}")
+        with st.expander("🐛 Dettaglio"):
+            st.code(traceback.format_exc())
+
+st.markdown("---")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TEST:  CONTRASTO TOMOGRAFICO
 # ══════════════════════════════════════════════════════════════════════════════
 if "Contrasto Tomografico" in test_choice:
