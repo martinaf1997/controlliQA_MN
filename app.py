@@ -1,19 +1,20 @@
 """
 SPECT & Scintigrafia Planare - Controllo Qualità
 Basato su pylinac.nuclear (IAEA NMQC toolkit reimplementation)
+Supporta serie multi-file DICOM (es. Siemens I100000W, I100001W, ...)
 """
 
 import streamlit as st
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import tempfile
-import os
-import io
-import traceback
+import tempfile, os, io, traceback, copy
 from pathlib import Path
 
-# ── Page config ──────────────────────────────────────────────────────────────
+import numpy as np
+import pydicom
+
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="SPECT/Scintigrafia QC",
     page_icon="☢️",
@@ -27,7 +28,7 @@ st.markdown("""
   [data-testid="stSidebar"] { background: #0d1b2a; }
   [data-testid="stSidebar"] * { color: #e0e8f0 !important; }
   .main-title { font-size:2.2rem; font-weight:700; color:#00b4d8; margin-bottom:0; }
-  .sub-title  { font-size:1rem;   color:#90e0ef; margin-top:0; margin-bottom:1.5rem; }
+  .sub-title  { font-size:1rem; color:#90e0ef; margin-top:0; margin-bottom:1.5rem; }
   .metric-card {
     background:#0d1b2a; border-radius:10px; padding:16px 20px;
     border-left:4px solid #00b4d8; margin-bottom:10px;
@@ -38,19 +39,123 @@ st.markdown("""
   .badge-pass { background:#1a3a2a; color:#40c878; border-radius:6px; padding:2px 10px; font-size:.85rem; font-weight:600; }
   .badge-fail { background:#3a1a1a; color:#ff6b6b; border-radius:6px; padding:2px 10px; font-size:.85rem; font-weight:600; }
   .badge-info { background:#1a2a3a; color:#74c7ec; border-radius:6px; padding:2px 10px; font-size:.85rem; font-weight:600; }
-  .stAlert    { border-radius:10px !important; }
-  .section-header { color:#00b4d8; font-size:1.15rem; font-weight:700; border-bottom:1px solid #00b4d8; padding-bottom:4px; margin-top:1.2rem; margin-bottom:.8rem; }
+  .section-header { color:#00b4d8; font-size:1.15rem; font-weight:700;
+    border-bottom:1px solid #00b4d8; padding-bottom:4px;
+    margin-top:1.2rem; margin-bottom:.8rem; }
+  .file-chip {
+    display:inline-block; background:#1a2a3a; color:#90e0ef;
+    border-radius:6px; padding:2px 8px; font-size:.78rem;
+    margin:2px; font-family:monospace;
+  }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def save_upload(uploaded_file) -> str:
-    """Save uploaded file to a temp path and return the path."""
-    suffix = Path(uploaded_file.name).suffix
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded_file.read())
-        return tmp.name
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def read_dicom_safe(data: bytes) -> pydicom.Dataset:
+    """Read DICOM from bytes, with force=True for files without preamble."""
+    return pydicom.dcmread(io.BytesIO(data), force=True)
+
+
+def merge_to_multiframe(datasets: list[pydicom.Dataset]) -> pydicom.Dataset:
+    """
+    Merge a list of single-frame NM DICOM datasets into one multi-frame dataset.
+    Sorted by InstanceNumber so frame order is correct.
+    """
+    # Sort by InstanceNumber (default to index if missing)
+    datasets = sorted(
+        datasets,
+        key=lambda d: int(d.get("InstanceNumber", 0))
+    )
+
+    # Stack pixel arrays → shape (N, rows, cols)
+    arrays = []
+    for d in datasets:
+        arr = d.pixel_array
+        if arr.ndim == 2:
+            arrays.append(arr)
+        else:
+            # already multi-frame — flatten into list
+            for i in range(arr.shape[0]):
+                arrays.append(arr[i])
+
+    stacked = np.stack(arrays, axis=0)
+
+    # Build merged dataset from first file's metadata
+    merged = copy.deepcopy(datasets[0])
+    merged.NumberOfFrames = len(arrays)
+
+    # Write pixel data
+    merged.PixelData = stacked.astype(stacked.dtype).tobytes()
+    merged["PixelData"].VR = "OB"
+
+    return merged, len(arrays)
+
+
+def save_merged_dcm(datasets: list[pydicom.Dataset]) -> tuple[str, int]:
+    """Merge datasets and save to a temp .dcm file. Returns (path, n_frames)."""
+    merged, n_frames = merge_to_multiframe(datasets)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".dcm")
+    pydicom.dcmwrite(tmp.name, merged)
+    tmp.close()
+    return tmp.name, n_frames
+
+
+def load_uploaded_files(uploaded_files) -> tuple[str, list, dict]:
+    """
+    Load one or more uploaded files, validate as NM DICOM, merge if needed.
+    Returns (dcm_path, datasets, meta_info).
+    """
+    datasets = []
+    errors   = []
+
+    for uf in uploaded_files:
+        data = uf.read()
+        try:
+            ds = read_dicom_safe(data)
+            if ds.get("Modality", "") != "NM":
+                errors.append(f"⚠️ `{uf.name}` non è NM (Modality={ds.get('Modality','?')})")
+                continue
+            datasets.append(ds)
+        except Exception as e:
+            errors.append(f"⚠️ `{uf.name}` non è DICOM valido: {e}")
+
+    if errors:
+        for e in errors:
+            st.warning(e)
+
+    if not datasets:
+        return None, [], {}
+
+    # Collect meta from first dataset
+    d0 = datasets[0]
+    meta = {
+        "studio":  d0.get("StudyDescription", ""),
+        "serie":   d0.get("SeriesDescription", ""),
+        "modello": d0.get("ManufacturerModelName", d0.get("Manufacturer", "")),
+        "data":    d0.get("StudyDate", ""),
+        "paziente": str(d0.get("PatientName", "")),
+    }
+
+    if len(datasets) == 1:
+        # Single file — save directly
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".dcm")
+        raw = datasets[0]._write_to_bytes() if hasattr(datasets[0], "_write_to_bytes") else None
+        if raw is None:
+            pydicom.dcmwrite(tmp.name, datasets[0])
+        tmp.close()
+        n_frames = int(datasets[0].get("NumberOfFrames", 1))
+        dcm_path = tmp.name
+    else:
+        dcm_path, n_frames = save_merged_dcm(datasets)
+
+    meta["n_files"]  = len(datasets)
+    meta["n_frames"] = n_frames
+
+    return dcm_path, datasets, meta
 
 
 def fig_to_bytes(fig) -> bytes:
@@ -75,6 +180,14 @@ def metric_card(label, value, unit="", status=None):
     </div>""", unsafe_allow_html=True)
 
 
+def show_all_figs():
+    """Render all open matplotlib figures into Streamlit."""
+    for fn in plt.get_fignums():
+        fig = plt.figure(fn)
+        st.image(fig_to_bytes(fig), use_container_width=True)
+    plt.close("all")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -95,11 +208,14 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.markdown("### 📁 Carica immagine DICOM")
-    uploaded = st.file_uploader(
-        "File `.dcm`",
-        type=["dcm", "DCM"],
-        help="Immagine DICOM acquisita con gamma-camera / SPECT",
+    st.markdown("### 📁 Carica file DICOM")
+    st.caption("Puoi caricare **uno o più file** della stessa serie (es. `I100000W`, `I100001W`, …). Verranno fusi automaticamente in un'unica serie multi-frame.")
+
+    uploaded_files = st.file_uploader(
+        "File DICOM (con o senza estensione)",
+        type=None,
+        accept_multiple_files=True,
+        help="Seleziona tutti i file della serie. Ordine non importa — vengono ordinati per InstanceNumber.",
     )
 
     st.markdown("---")
@@ -112,62 +228,63 @@ with st.sidebar:
 st.markdown('<p class="main-title">☢️ Controllo Qualità SPECT & Scintigrafia Planare</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-title">Analisi automatica basata su IAEA No. 6 · pylinac · Implementazione NMQC</p>', unsafe_allow_html=True)
 
-# ── Import check ──────────────────────────────────────────────────────────────
 try:
     from pylinac import nuclear as pnuc
-    PYLINAC_OK = True
 except ImportError:
-    PYLINAC_OK = False
-
-if not PYLINAC_OK:
-    st.error("""
-**pylinac non trovato.** Installa con:
-```bash
-pip install pylinac
-```
-""")
+    st.error("**pylinac non trovato.** Installa con: `pip install pylinac`")
     st.stop()
 
-# ── No file uploaded yet ───────────────────────────────────────────────────────
-if uploaded is None:
-    st.info("👈 Carica un file DICOM dalla barra laterale per iniziare l'analisi.")
-
+# ── No files uploaded yet ─────────────────────────────────────────────────────
+if not uploaded_files:
+    st.info("👈 Carica uno o più file DICOM dalla barra laterale per iniziare.")
     st.markdown("---")
-    st.markdown("### 📋 Test disponibili")
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("""
-**🔆 Contrasto Tomografico** *(IAEA test 4.3.9)*
-- Misura il contrasto del sistema SPECT
-- Rileva automaticamente slice di uniformità e sfere
-- Calcola contrasto per ogni sfera
+**🔆 Contrasto Tomografico** *(IAEA 4.3.9)*  
+Contrasto sfere SPECT, baseline uniformità
 
-**📊 Uniformità Planare** *(IAEA test 2.3.3)*
-- Uniformità integrale e differenziale
-- Analisi UFOV e CFOV per ogni frame
-- Sliding window per uniformità differenziale
+**📊 Uniformità Planare** *(IAEA 2.3.3)*  
+Uniformità integrale/differenziale UFOV & CFOV
 """)
     with col2:
         st.markdown("""
-**↻ Centro di Rotazione** *(IAEA test 4.3.6)*
-- Deviazione dal centro di rotazione atteso
-- Fit sinusoidale delle proiezioni
+**↻ Centro di Rotazione** *(IAEA 4.3.6)*  
+Deviazione dal centro di rotazione atteso
 
-**🔍 Risoluzione Tomografica** *(IAEA test 4.3.4)*
-- FWHM/FWTM calcolato dal fit gaussiano
-- Profili su tre assi (x, y, z)
+**🔍 Risoluzione Tomografica** *(IAEA 4.3.4)*  
+FWHM/FWTM da fit gaussiano su 3 assi
 
-**📈 Max Count Rate** *(IAEA test 2.3.11.4)*
-- Count rate massimo per frame
-- Plot count rate vs numero frame
+**📈 Max Count Rate** *(IAEA 2.3.11.4)*  
+Count rate massimo per frame
 """)
     st.stop()
 
-# ── File uploaded — run analysis ───────────────────────────────────────────────
-dcm_path = save_upload(uploaded)
+# ── Load & merge files ────────────────────────────────────────────────────────
+dcm_path, datasets, meta = load_uploaded_files(uploaded_files)
 
-st.success(f"✅ File caricato: `{uploaded.name}` ({uploaded.size / 1024:.1f} KB)")
+if dcm_path is None:
+    st.error("Nessun file DICOM NM valido trovato tra quelli caricati.")
+    st.stop()
+
+# ── File summary banner ───────────────────────────────────────────────────────
+n_files  = meta["n_files"]
+n_frames = meta["n_frames"]
+
+if n_files == 1:
+    st.success(f"✅ **1 file caricato** · {uploaded_files[0].name} · Frame: {n_frames}")
+else:
+    st.success(f"✅ **{n_files} file caricati** e fusi in {n_frames} frame")
+    chips = "".join(f'<span class="file-chip">{uf.name}</span>' for uf in uploaded_files)
+    st.markdown(chips, unsafe_allow_html=True)
+
+if meta["studio"] or meta["serie"]:
+    st.info(f"📋 **Studio:** {meta['studio']}  |  **Serie:** {meta['serie']}  |  **Scanner:** {meta['modello']}")
+
 st.markdown("---")
+
+_tmp_files = [dcm_path]  # track for cleanup
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TEST:  CONTRASTO TOMOGRAFICO
@@ -179,26 +296,23 @@ if "Contrasto Tomografico" in test_choice:
         col1, col2, col3 = st.columns(3)
         with col1:
             sphere_diameters_str = st.text_input(
-                "Diametri sfere (mm) — separati da virgola",
+                "Diametri sfere (mm) — virgola",
                 value="38, 31.8, 25, 19.1, 12.7, 9.5",
-                help="Es: 38, 31.8, 25, 19.1, 12.7, 9.5"
             )
         with col2:
             sphere_angles_str = st.text_input(
-                "Angoli sfere (°) — separati da virgola",
+                "Angoli sfere (°) — virgola",
                 value="-10, -70, -130, 170, 110, 50",
-                help="Un angolo per ogni sfera"
             )
         with col3:
-            ufov_ratio   = st.slider("UFOV ratio", 0.80, 1.00, 0.95, 0.01)
-            search_win   = st.number_input("Search window (px)", 1, 20, 5)
+            ufov_ratio    = st.slider("UFOV ratio", 0.80, 1.00, 0.95, 0.01)
+            search_win    = st.number_input("Search window (px)", 1, 20, 5)
             search_slices = st.number_input("Search slices", 1, 10, 3)
 
-    if st.button("🚀 Esegui Analisi Contrasto Tomografico", type="primary"):
+    if st.button("🚀 Esegui Analisi", type="primary"):
         try:
             sphere_diameters = [float(x.strip()) for x in sphere_diameters_str.split(",")]
             sphere_angles    = [float(x.strip()) for x in sphere_angles_str.split(",")]
-
             if len(sphere_diameters) != len(sphere_angles):
                 st.error("Il numero di diametri deve corrispondere al numero di angoli!")
                 st.stop()
@@ -214,41 +328,25 @@ if "Contrasto Tomografico" in test_choice:
                 )
                 results = tc.results_data()
 
-            st.markdown("#### 📊 Risultati")
-
             col_r1, col_r2 = st.columns([1, 2])
             with col_r1:
                 metric_card("Baseline Uniformità", f"{results.uniformity_baseline:.4f}", "", "info")
                 st.markdown("**Contrasto per sfera:**")
                 for name, sphere in results.spheres.items():
-                    contrast_val = sphere.contrast if hasattr(sphere, "contrast") else getattr(sphere, "contrast_value", "N/A")
-                    status = "pass" if isinstance(contrast_val, float) and contrast_val > 0 else "info"
-                    metric_card(
-                        f"Sfera {name}",
-                        f"{contrast_val:.3f}" if isinstance(contrast_val, float) else str(contrast_val),
-                        "",
-                        status
-                    )
-
+                    cv = getattr(sphere, "contrast", getattr(sphere, "contrast_value", "N/A"))
+                    status = "pass" if isinstance(cv, float) and cv > 0 else "info"
+                    metric_card(f"Sfera {name}", f"{cv:.3f}" if isinstance(cv, float) else str(cv), "", status)
             with col_r2:
-                st.markdown("**📈 Visualizzazione ROI**")
-                fig = tc.plot(show=False)
-                if fig is None:
-                    fig, _ = plt.subplots()
-                    tc.plot()
-                    fig = plt.gcf()
-                st.image(fig_to_bytes(fig), use_container_width=True)
+                tc.plot(show=False)
+                fig = plt.gcf()
+                img_bytes = fig_to_bytes(fig)
                 plt.close("all")
-                st.download_button(
-                    "⬇️ Scarica immagine analisi",
-                    data=fig_to_bytes(fig),
-                    file_name="tomographic_contrast.png",
-                    mime="image/png"
-                )
+                st.image(img_bytes, use_container_width=True)
+                st.download_button("⬇️ Scarica immagine", img_bytes, "tomographic_contrast.png", "image/png")
 
         except Exception as e:
-            st.error(f"Errore durante l'analisi: {e}")
-            with st.expander("🐛 Dettaglio errore"):
+            st.error(f"Errore: {e}")
+            with st.expander("🐛 Dettaglio"):
                 st.code(traceback.format_exc())
 
 
@@ -259,75 +357,43 @@ elif "Uniformità Planare" in test_choice:
     st.markdown('<div class="section-header">📊 Uniformità Planare (IAEA 2.3.3)</div>', unsafe_allow_html=True)
 
     with st.expander("⚙️ Parametri analisi", expanded=True):
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            ufov_ratio = st.slider("UFOV ratio", 0.80, 1.00, 0.95, 0.01)
-        with col2:
-            cfov_ratio = st.slider("CFOV ratio", 0.50, 0.90, 0.75, 0.01)
-        with col3:
-            window_size = st.number_input("Window size (px)", 3, 15, 5)
-        with col4:
-            threshold = st.slider("Threshold", 0.50, 1.00, 0.75, 0.05)
+        c1, c2, c3, c4 = st.columns(4)
+        ufov_ratio  = c1.slider("UFOV ratio",   0.80, 1.00, 0.95, 0.01)
+        cfov_ratio  = c2.slider("CFOV ratio",   0.50, 0.90, 0.75, 0.01)
+        window_size = c3.number_input("Window size (px)", 3, 15, 5)
+        threshold   = c4.slider("Threshold",    0.50, 1.00, 0.75, 0.05)
 
-    if st.button("🚀 Esegui Analisi Uniformità Planare", type="primary"):
+    if st.button("🚀 Esegui Analisi", type="primary"):
         try:
             with st.spinner("Analisi in corso..."):
                 pu = pnuc.PlanarUniformity(dcm_path)
-                pu.analyze(
-                    ufov_ratio=ufov_ratio,
-                    cfov_ratio=cfov_ratio,
-                    window_size=window_size,
-                    threshold=threshold,
-                )
+                pu.analyze(ufov_ratio=ufov_ratio, cfov_ratio=cfov_ratio,
+                           window_size=window_size, threshold=threshold)
                 results = pu.results_data()
 
-            st.markdown("#### 📊 Risultati")
-
-            # Display results - handle both list and dict structures
-            frames_data = None
-            if hasattr(results, "frames"):
-                frames_data = results.frames
-            elif hasattr(results, "__dict__"):
-                frames_data = results.__dict__
-
-            if frames_data:
-                col1, col2 = st.columns([1, 2])
-                with col1:
-                    if isinstance(frames_data, list):
-                        for i, frame in enumerate(frames_data):
-                            st.markdown(f"**Frame {i+1}**")
-                            if hasattr(frame, "ufov_integral_uniformity"):
-                                iu = frame.ufov_integral_uniformity
-                                du = frame.ufov_differential_uniformity
-                                ciu = frame.cfov_integral_uniformity
-                                cdu = frame.cfov_differential_uniformity
-                                metric_card(f"F{i+1} UFOV Integrale", f"{iu:.2f}", "%",
-                                            "pass" if iu < 5 else "fail")
-                                metric_card(f"F{i+1} UFOV Differenziale", f"{du:.2f}", "%",
-                                            "pass" if du < 5 else "fail")
-                                metric_card(f"F{i+1} CFOV Integrale", f"{ciu:.2f}", "%",
-                                            "pass" if ciu < 5 else "fail")
-                                metric_card(f"F{i+1} CFOV Differenziale", f"{cdu:.2f}", "%",
-                                            "pass" if cdu < 5 else "fail")
-                    else:
-                        st.json(frames_data if isinstance(frames_data, dict) else str(frames_data))
-
-                with col2:
-                    st.markdown("**📈 Visualizzazione UFOV/CFOV**")
-                    pu.plot(show=False)
-                    fig = plt.gcf()
-                    st.image(fig_to_bytes(fig), use_container_width=True)
-                    plt.close("all")
-            else:
-                st.info("Analisi completata. Visualizzazione:")
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                frames_data = getattr(results, "frames", None)
+                if frames_data and isinstance(frames_data, list):
+                    for i, frame in enumerate(frames_data):
+                        st.markdown(f"**Frame {i+1}**")
+                        for attr, label in [
+                            ("ufov_integral_uniformity",    "UFOV Integrale"),
+                            ("ufov_differential_uniformity","UFOV Differenziale"),
+                            ("cfov_integral_uniformity",    "CFOV Integrale"),
+                            ("cfov_differential_uniformity","CFOV Differenziale"),
+                        ]:
+                            if hasattr(frame, attr):
+                                v = getattr(frame, attr)
+                                metric_card(f"F{i+1} {label}", f"{v:.2f}", "%",
+                                            "pass" if v < 5 else "fail")
+            with col2:
                 pu.plot(show=False)
-                fig = plt.gcf()
-                st.image(fig_to_bytes(fig), use_container_width=True)
-                plt.close("all")
+                show_all_figs()
 
         except Exception as e:
-            st.error(f"Errore durante l'analisi: {e}")
-            with st.expander("🐛 Dettaglio errore"):
+            st.error(f"Errore: {e}")
+            with st.expander("🐛 Dettaglio"):
                 st.code(traceback.format_exc())
 
 
@@ -336,42 +402,30 @@ elif "Uniformità Planare" in test_choice:
 # ══════════════════════════════════════════════════════════════════════════════
 elif "Centro di Rotazione" in test_choice:
     st.markdown('<div class="section-header">↻ Centro di Rotazione (IAEA 4.3.6)</div>', unsafe_allow_html=True)
+    st.info("Analizza la deviazione del pannello SPECT dal centro di rotazione tramite fit sinusoidale.")
 
-    st.info("Il test analizza la deviazione del pannello SPECT dal centro di rotazione atteso, tramite fit sinusoidale delle proiezioni.")
-
-    if st.button("🚀 Esegui Analisi Centro di Rotazione", type="primary"):
+    if st.button("🚀 Esegui Analisi", type="primary"):
         try:
             with st.spinner("Analisi in corso..."):
                 cor = pnuc.CenterOfRotation(dcm_path)
                 cor.analyze()
                 results = cor.results_data()
 
-            st.markdown("#### 📊 Risultati")
-
             col1, col2 = st.columns([1, 2])
             with col1:
-                if hasattr(results, "x_offset_mm"):
-                    status_x = "pass" if abs(results.x_offset_mm) < 2.0 else "fail"
-                    metric_card("Deviazione X", f"{results.x_offset_mm:.3f}", "mm", status_x)
-                if hasattr(results, "y_offset_mm"):
-                    status_y = "pass" if abs(results.y_offset_mm) < 2.0 else "fail"
-                    metric_card("Deviazione Y", f"{results.y_offset_mm:.3f}", "mm", status_y)
                 if hasattr(results, "__dict__"):
                     for k, v in results.__dict__.items():
-                        if isinstance(v, (int, float)) and k not in ("x_offset_mm", "y_offset_mm"):
-                            metric_card(k.replace("_", " ").title(), f"{v:.4f}", "", "info")
-
+                        if isinstance(v, (int, float)):
+                            unit   = "mm" if "mm" in k else ""
+                            status = "pass" if abs(v) < 2 else "fail"
+                            metric_card(k.replace("_", " ").title(), f"{v:.3f}", unit, status)
             with col2:
-                st.markdown("**📈 Fit Sinusoidale & Residui**")
                 cor.plot(show=False)
-                for fig_num in plt.get_fignums():
-                    fig = plt.figure(fig_num)
-                    st.image(fig_to_bytes(fig), use_container_width=True)
-                plt.close("all")
+                show_all_figs()
 
         except Exception as e:
-            st.error(f"Errore durante l'analisi: {e}")
-            with st.expander("🐛 Dettaglio errore"):
+            st.error(f"Errore: {e}")
+            with st.expander("🐛 Dettaglio"):
                 st.code(traceback.format_exc())
 
 
@@ -380,36 +434,29 @@ elif "Centro di Rotazione" in test_choice:
 # ══════════════════════════════════════════════════════════════════════════════
 elif "Risoluzione Tomografica" in test_choice:
     st.markdown('<div class="section-header">🔍 Risoluzione Tomografica (IAEA 4.3.4)</div>', unsafe_allow_html=True)
+    st.info("FWHM/FWTM calcolati dal fit gaussiano su tre assi.")
 
-    st.info("Misura la risoluzione SPECT tramite FWHM/FWTM calcolati dal fit gaussiano su tre assi.")
-
-    if st.button("🚀 Esegui Analisi Risoluzione Tomografica", type="primary"):
+    if st.button("🚀 Esegui Analisi", type="primary"):
         try:
             with st.spinner("Analisi in corso..."):
                 tr = pnuc.TomographicResolution(dcm_path)
                 tr.analyze()
                 results = tr.results_data()
 
-            st.markdown("#### 📊 Risultati")
             col1, col2 = st.columns([1, 2])
             with col1:
                 if hasattr(results, "__dict__"):
                     for k, v in results.__dict__.items():
                         if isinstance(v, (int, float)):
-                            unit = "mm" if "mm" in k else ""
-                            metric_card(k.replace("_", " ").title(), f"{v:.3f}", unit, "info")
-
+                            metric_card(k.replace("_", " ").title(), f"{v:.3f}",
+                                        "mm" if "mm" in k else "", "info")
             with col2:
-                st.markdown("**📈 Profili e Fit Gaussiani (X, Y, Z)**")
                 tr.plot(show=False)
-                for fig_num in plt.get_fignums():
-                    fig = plt.figure(fig_num)
-                    st.image(fig_to_bytes(fig), use_container_width=True)
-                plt.close("all")
+                show_all_figs()
 
         except Exception as e:
-            st.error(f"Errore durante l'analisi: {e}")
-            with st.expander("🐛 Dettaglio errore"):
+            st.error(f"Errore: {e}")
+            with st.expander("🐛 Dettaglio"):
                 st.code(traceback.format_exc())
 
 
@@ -421,19 +468,15 @@ elif "Max Count Rate" in test_choice:
 
     with st.expander("⚙️ Parametri analisi", expanded=True):
         frame_resolution = st.number_input(
-            "Risoluzione frame (sec/frame)",
-            min_value=0.1, max_value=60.0, value=0.5, step=0.1,
-            help="Intervallo temporale tra frame acquisiti"
-        )
+            "Risoluzione frame (sec/frame)", 0.1, 60.0, 0.5, 0.1)
 
-    if st.button("🚀 Esegui Analisi Max Count Rate", type="primary"):
+    if st.button("🚀 Esegui Analisi", type="primary"):
         try:
             with st.spinner("Analisi in corso..."):
                 mcr = pnuc.MaxCountRate(dcm_path)
                 mcr.analyze(frame_resolution=frame_resolution)
                 results = mcr.results_data()
 
-            st.markdown("#### 📊 Risultati")
             col1, col2 = st.columns([1, 2])
             with col1:
                 if hasattr(mcr, "max_countrate"):
@@ -442,33 +485,25 @@ elif "Max Count Rate" in test_choice:
                     metric_card("Frame Massimo", str(mcr.max_frame), "", "info")
                 if hasattr(mcr, "max_time"):
                     metric_card("Tempo Massimo", f"{mcr.max_time:.1f}", "s", "info")
-                if hasattr(results, "__dict__"):
-                    for k, v in results.__dict__.items():
-                        if isinstance(v, (int, float)) and k not in ("max_countrate", "max_frame", "max_time"):
-                            metric_card(k.replace("_", " ").title(), f"{v:.3f}", "", "info")
-
             with col2:
-                st.markdown("**📈 Count Rate vs Frame**")
                 mcr.plot(show=False)
-                fig = plt.gcf()
-                st.image(fig_to_bytes(fig), use_container_width=True)
-                plt.close("all")
+                show_all_figs()
 
         except Exception as e:
-            st.error(f"Errore durante l'analisi: {e}")
-            with st.expander("🐛 Dettaglio errore"):
+            st.error(f"Errore: {e}")
+            with st.expander("🐛 Dettaglio"):
                 st.code(traceback.format_exc())
 
-# ── Footer ────────────────────────────────────────────────────────────────────
+
+# ── Footer & cleanup ──────────────────────────────────────────────────────────
 st.markdown("---")
 st.markdown(
-    "<small>⚕️ Uso esclusivamente per controllo qualità interno · Basato su <b>pylinac.nuclear</b> "
-    "(reimplementazione IAEA NMQC toolkit) · Non sostituisce la valutazione del fisico medico.</small>",
-    unsafe_allow_html=True
+    "<small>⚕️ Uso esclusivamente per controllo qualità interno · "
+    "pylinac.nuclear · IAEA NMQC toolkit · Non sostituisce la valutazione del fisico medico.</small>",
+    unsafe_allow_html=True,
 )
-
-# Cleanup temp file
-try:
-    os.unlink(dcm_path)
-except Exception:
-    pass
+for f in _tmp_files:
+    try:
+        os.unlink(f)
+    except Exception:
+        pass
